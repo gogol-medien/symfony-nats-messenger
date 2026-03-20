@@ -105,6 +105,8 @@ class TestableNatsTransport extends NatsTransport
         if (isset($components['user']) && isset($components['pass']) && !empty($components['user']) && !empty($components['pass'])) {
             $clientConnectionSettings['user'] = $components['user'];
             $clientConnectionSettings['pass'] = $components['pass'];
+        } elseif (isset($components['user']) && !empty($components['user'])) {
+            $clientConnectionSettings['token'] = $components['user'];
         }
 
         // Extract stream name and topic from path
@@ -251,6 +253,18 @@ class NatsTransportTest extends TestCase
         $dsn = 'nats://admin:password@localhost:4222/test-stream/test-topic';
 
         $transport = new NatsTransport($dsn, []);
+
+        $this->assertInstanceOf(NatsTransport::class, $transport);
+    }
+
+    /**
+     * @test
+     */
+    public function constructor_WithTokenAuthentication_ParsesToken(): void
+    {
+        $dsn = 'nats://my-secret-token@localhost:4222/test-stream/test-topic';
+
+        $transport = new TestableNatsTransport($dsn, []);
 
         $this->assertInstanceOf(NatsTransport::class, $transport);
     }
@@ -722,6 +736,18 @@ class NatsTransportTest extends TestCase
     public function buildFromDsn_WithUsernameAndPassword_ParsesCredentials(): void
     {
         $dsn = 'nats://testuser:testpass@localhost:4222/stream/topic';
+
+        $transport = new NatsTransport($dsn, []);
+
+        $this->assertInstanceOf(NatsTransport::class, $transport);
+    }
+
+    /**
+     * @test
+     */
+    public function buildFromDsn_WithTokenAuthentication_ParsesToken(): void
+    {
+        $dsn = 'nats://my-secret-token@localhost:4222/stream/topic';
 
         $transport = new NatsTransport($dsn, []);
 

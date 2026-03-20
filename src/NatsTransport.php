@@ -626,6 +626,8 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
         if (isset($components['user']) && isset($components['pass']) && !empty($components['user']) && !empty($components['pass'])) {
             $clientConnectionSettings['user'] = $components['user'];
             $clientConnectionSettings['pass'] = $components['pass'];
+        } elseif (isset($components['user']) && !empty($components['user'])) {
+            $clientConnectionSettings['token'] = $components['user'];
         }
 
         // Extract stream name and topic from path (format: /stream_name/topic_name)
