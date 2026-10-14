@@ -66,6 +66,8 @@ composer nats:stop               # stop NATS
   missing consumer reports 503, not 404: with `auto_setup` it is re-provisioned once, otherwise `get()` throws.
   The client also reports a pull that got no answer before its own deadline as 408 ("No messages received
   within timeout"); that one makes the next operation PING first, since the server did not answer.
+  A pull a failover ended - 409 "Leadership Change" or "Server Shutdown", or the connection lost during the
+  pull - is an empty pull too, up to three in a row (`FAILOVERS_ABSORBED_IN_A_ROW`); a failed dial propagates.
 - **`setup()` create-then-update.** On a stream conflict it reads the live config, **merges** subjects,
   preserves server fields, and updates - it never blindly overwrites an existing stream.
 - **Retry strategy:** `retry_handler=symfony` (default) → TERM (Symfony's failure transport retries);

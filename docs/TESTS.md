@@ -32,6 +32,7 @@ This document maps each feature of the Symfony NATS Messenger Bridge to the test
 | **Duplicate protection (`deduplicate`, `DeduplicationIdStamp`)** | `testSendWithDeduplicationStampsTheEnvelopeAndPublishesItsMessageId`, `testSendKeepsTheDeduplicationIdTheEnvelopeCarries`, `testSendGivesEachRetryAndTheFailureTransportCopyAMessageIdOfItsOwn`, `testSendWithoutDeduplicationSendsNoMessageIdAndAddsNoStamp`, `testSendUsesAnApplicationDeduplicationIdWithTheOptionOff`, `testSendDelayedMessageWithDeduplicationPublishesItsMessageId`, `testSendGivesTheCopiesForTwoTransportsOnOneStreamMessageIdsOfTheirOwn`, `testSendGivesTheFailureCopiesOfTwoTransportsMessageIdsOfTheirOwn` |
 | **Igbinary fallback** | `testConstructorWithoutIgbinaryDoesNotCrash` |
 | **TLS DSN** | `testConstructorWithTlsDsnInitializesTransport` |
+| **A pull a failover ended (409 "Leadership Change" or "Server Shutdown", or the connection lost during it) is an empty batch, up to three in a row; a failed dial and any other error still propagate** | `testPullAFailoverEndedIsAnEmptyBatch`, `testAPullErrorThatIsNoFailoverStillPropagatesWithoutAutoSetup`, `testAutoSetupDoesNotReprovisionForAFailover`, `testConnectionLostDuringAPullIsAnEmptyBatchAndTheNextPullDialsAgain`, `testFailedDialAfterAConnectionLostDuringAPullPropagates`, `testFailoversInARowAreEmptyBatchesOnlyUpToTheLimit`, `testConnectionLostAfterTheLimitOfFailoversPropagates`, `testACompletedPullStartsTheFailoverCountAfresh`, `testWorkerKeepsRunningThroughALeaderHandover` |
 
 ### Unanswered Pull (`tests/unit/UnansweredPullTest.php`)
 
@@ -40,6 +41,7 @@ Runs the real client against an in-memory server that answers the handshake and 
 | Feature | Tests |
 |---------|-------|
 | **A pull the server did not answer makes the next operation check the connection; one the server ended with 408 does not** | `testOnlyAPullTheServerDidNotAnswerMakesTheNextOneCheckTheConnection` |
+| **The real client reports a pull a leader handover ended (409 "Leadership Change") the way the transport reads as an empty batch, and the 409 makes the next operation check nothing** | `testAPullALeaderHandoverEndedIsAnEmptyBatchAndNeedsNoCheck` |
 
 ### Transport Factory (`tests/unit/NatsTransportFactoryTest.php`)
 

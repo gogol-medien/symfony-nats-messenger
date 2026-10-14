@@ -71,6 +71,23 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
      */
     private const UNANSWERED_PULL = 'No messages received within timeout';
 
+    /**
+     * The descriptions of the 409 statuses a pull ends with when its consumer's leader moves or its server goes
+     * away, both of which clear on their own: a server entering lame duck mode, as each one does in a rolling
+     * restart of a cluster, hands its leaders over before it shuts down, and so does a leader that steps down. The
+     * next pull reaches the new leader. Other 409s, such as "Consumer Deleted", keep their meaning
+     * ({@see recoverFromFetchFailure()}).
+     */
+    private const FAILOVER_PULL_STATUSES = ['Leadership Change', 'Server Shutdown'];
+
+    /**
+     * How many pulls in a row {@see get()} reads as an empty batch when a failover ended them - with a 409 above, or
+     * by losing the connection - before it lets the failure propagate. One server leaving costs a consumer at most
+     * two in a row: its leader handing over, then its connection to that server closing. More, with no pull
+     * completing in between, means pulls keep failing, which an empty batch must not hide.
+     */
+    private const FAILOVERS_ABSORBED_IN_A_ROW = 3;
+
     /** Symfony serializer used to encode/decode envelopes to/from wire payloads. */
     protected SerializerInterface $serializer;
 
@@ -103,6 +120,12 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
      * checks it first ({@see awaitOnConnection()}).
      */
     private bool $checkBeforeNextUse = false;
+
+    /**
+     * How many pulls in a row a failover ended ({@see absorbFailover()}); a pull that completes, with messages or
+     * without, resets it.
+     */
+    private int $failoversInARow = 0;
 
     /**
      * Creates a transport instance from DSN/options and optional serializer override.
@@ -289,6 +312,11 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
      * the connection first, unless ping_after_idle is 0. A missing consumer or stream does not report
      * 404 but 503, or 409 when the consumer is deleted mid-pull, and without auto_setup that
      * JetStreamException propagates.
+     * A pull a failover ended is an empty result as well: status 409 "Leadership Change" or "Server Shutdown",
+     * which a server sends when it enters lame duck mode or a leader steps down, or the connection lost during the
+     * pull, after which the next operation dials again. That holds for up to
+     * {@see FAILOVERS_ABSORBED_IN_A_ROW} pulls in a row; the next such failure propagates. A dial that fails
+     * propagates as it always has.
      * A message without a reply (ack) subject is skipped (it can be neither acknowledged nor
      * rejected); a message with an empty payload is TERMed so JetStream stops redelivering it,
      * since it can never decode into an envelope. A header whose name is a decimal integer, such as
@@ -304,15 +332,34 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
     public function get(): iterable
     {
         $this->autoSetupIfEnabled();
+        // Dialling happens here, before the pull, so that only a connection lost during the pull reads as a
+        // failover below, while a dial that fails propagates.
+        $jetStream = $this->jetStream();
 
         try {
-            $messages = $this->fetchBatchMessages();
-        } catch (JetStreamException $exception) {
-            $messages = $this->recoverFromFetchFailure($exception);
+            $messages = $this->fetchBatchMessages($jetStream);
+        } catch (ConnectionException $lost) {
+            // The client runs with reconnect off: the server the pull ran on shut down, or the connection dropped.
+            // The next operation dials again ({@see connectIfNeeded()}); messages the pull may have delivered were
+            // not acknowledged, so JetStream redelivers them.
+            $this->absorbFailover($lost);
 
-            if ($messages === null) {
+            return [];
+        } catch (JetStreamException $exception) {
+            if (self::endedByFailover($exception)) {
+                $this->absorbFailover($exception);
+
                 return [];
             }
+
+            $messages = $this->recoverFromFetchFailure($exception);
+        }
+
+        // The pull completed, with messages or without: a failover that was underway is over.
+        $this->failoversInARow = 0;
+
+        if ($messages === null) {
+            return [];
         }
 
         foreach ($messages as $message) {
@@ -720,7 +767,8 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
      * The status codes matter and are easy to get wrong. A deleted durable consumer does NOT produce a
      * 404: nothing is subscribed to answer the pull request, so the client reports 503. Measured
      * directly against nats-server 2.10.29 and 2.14.2 by deleting the consumer and pulling:
-     * "JetStream pull request ended with status 503". 409 is what a consumer deleted mid-pull reports.
+     * "JetStream pull request ended with status 503". 409 is what a consumer deleted mid-pull reports; the 409s
+     * of a failover ({@see FAILOVER_PULL_STATUSES}) do not get here ({@see get()}).
      * A 404 reports a pull that found no messages, but re-provisioning on it as well is harmless when
      * the resources exist, so all three are treated as a sign that the consumer or stream it pulls from
      * may not be there.
@@ -741,7 +789,7 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
 
         if ($missingResource && $this->reprovisionForAutoSetup()) {
             try {
-                return $this->fetchBatchMessages();
+                return $this->fetchBatchMessages($this->jetStream());
             } catch (JetStreamException $retryException) {
                 // One re-provisioning attempt and one retry. The retry deliberately accepts a narrower
                 // set of codes than the recovery above: setup() just recreated the consumer, so at this
@@ -767,14 +815,44 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
     }
 
     /**
-     * Pulls one raw batch from the configured durable consumer.
+     * Whether a JetStream error that ended a pull is one of the 409s of a failover ({@see FAILOVER_PULL_STATUSES}).
+     * The client puts the status in the code and the server's description in the message: "JetStream pull request
+     * ended with status 409: Leadership Change".
+     */
+    private static function endedByFailover(JetStreamException $exception): bool
+    {
+        if ($exception->getCode() !== 409) {
+            return false;
+        }
+
+        foreach (self::FAILOVER_PULL_STATUSES as $description) {
+            if (str_contains($exception->getMessage(), $description)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Lets {@see get()} read a pull a failover ended as an empty batch, or propagates the failure once pulls have
+     * ended that way more than {@see FAILOVERS_ABSORBED_IN_A_ROW} times in a row.
+     */
+    private function absorbFailover(ConnectionException|JetStreamException $failure): void
+    {
+        if (++$this->failoversInARow > self::FAILOVERS_ABSORBED_IN_A_ROW) {
+            throw $failure;
+        }
+    }
+
+    /**
+     * Pulls one raw batch from the configured durable consumer, on the connection the caller got from
+     * {@see jetStream()}.
      *
      * @return list<NatsMessage>
      */
-    private function fetchBatchMessages(): array
+    private function fetchBatchMessages(JetStreamContext $jetStream): array
     {
-        $jetStream = $this->jetStream();
-
         try {
             return $this->awaitOnConnection($jetStream->fetchBatch(
                 $this->streamName,
@@ -798,8 +876,8 @@ class NatsTransport implements TransportInterface, MessageCountAwareInterface, S
      * Called internally by {@see jetStream()} before every JetStream call. The client runs with reconnect
      * off, so a connection the server closed or one that dropped leaves it in its terminal Closed state,
      * as do refused credentials, and it then refuses every request. Dialling again is what keeps a
-     * long-lived process working after that (#49): a consumer worker exits on the failed get() and its
-     * supervisor starts a new one, but a process that sends for longer than one request - a web app in
+     * long-lived process working after that (#49): a consumer worker reads a connection lost during a pull as an
+     * empty batch ({@see get()}) and its next pull dials again, and a process that sends for longer than one request - a web app in
      * worker mode, a daemon, a handler that dispatches - used to fail every later operation until it was
      * restarted. The client releases what it held on every terminal close, so a fresh connect() starts
      * clean. As after {@see close()}, auto_setup verifies provisioning again on the new connection.

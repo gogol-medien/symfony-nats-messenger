@@ -32,7 +32,13 @@ final class PullAnsweringServer implements TransportInterface
      */
     public array $received = [];
 
-    /** @var list<bool> Whether to answer each next pull, in order. A pull past the end is left unanswered. */
+    /**
+     * How to answer each next pull, in order: true with status 408, as a server ends a pull that found no messages,
+     * a string with that status line (such as "409 Leadership Change"), false not at all. A pull past the end is left
+     * unanswered.
+     *
+     * @var list<bool|string>
+     */
     public array $answerPulls = [];
 
     /** @var list<string> Chunks for the client to read. */
@@ -70,8 +76,9 @@ final class PullAnsweringServer implements TransportInterface
                 $this->sids[$words[1]] = $words[2];
             } elseif ($words[0] === 'PUB' && count($words) === 4 && str_starts_with($words[1], self::PULL_PREFIX)) {
                 $this->received[] = 'PULL';
-                if (array_shift($this->answerPulls) === true) {
-                    $status = "NATS/1.0 408 Request Timeout\r\n\r\n";
+                $answer = array_shift($this->answerPulls);
+                if ($answer === true || is_string($answer)) {
+                    $status = 'NATS/1.0 ' . ($answer === true ? '408 Request Timeout' : $answer) . "\r\n\r\n";
                     $length = strlen($status);
                     $this->send("HMSG {$words[2]} {$this->sids[$words[2]]} {$length} {$length}\r\n{$status}\r\n");
                 }
@@ -160,5 +167,32 @@ final class UnansweredPullTest extends TestCase
 
         // The handshake's PING, the unanswered pull, the check it called for, then two answered pulls.
         self::assertSame(['PING', 'PULL', 'PING', 'PULL', 'PULL'], $server->received);
+    }
+
+    /**
+     * The transport reads a pull a failover ended as an empty batch by the server's description in the client's
+     * message ({@see NatsTransport::get()}), which a new client version could word differently too. A 409 is the
+     * server's answer, so unlike a pull that got none it makes the next operation check nothing.
+     */
+    public function testAPullALeaderHandoverEndedIsAnEmptyBatchAndNeedsNoCheck(): void
+    {
+        $server = new PullAnsweringServer();
+        $server->answerPulls = ['409 Leadership Change', true];
+        $client = new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $server);
+        $transport = new ClientInjectedNatsTransport('nats://localhost:4222/stream/topic', [
+            'max_batch_timeout' => 0.001,
+            'ping_after_idle' => 30,
+        ]);
+        $transport->setClient($client);
+
+        try {
+            self::assertSame([], iterator_to_array($transport->get()));
+            self::assertSame([], iterator_to_array($transport->get()));
+        } finally {
+            $transport->close();
+        }
+
+        // The handshake's PING, then the two pulls: the 409 called for no check.
+        self::assertSame(['PING', 'PULL', 'PULL'], $server->received);
     }
 }

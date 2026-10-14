@@ -2872,6 +2872,300 @@ final class NatsTransportTest extends TestCase
         iterator_to_array($transport->get());
     }
 
+    /**
+     * A pull a failover ended is an empty batch: a 409 "Leadership Change", which a server entering lame duck mode
+     * sends while it hands its leaders over in a rolling restart, or "Server Shutdown". The next pull reaches the new
+     * leader. Both used to propagate and stop every worker pulling from the stream.
+     */
+    #[DataProvider('failoverPullStatusProvider')]
+    public function testPullAFailoverEndedIsAnEmptyBatch(string $description): void
+    {
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->expects(self::never())->method('decode');
+
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('fetchBatch')
+            ->willReturn(Future::error(self::pullEndedWith409($description)));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        self::assertSame([], array_values(iterator_to_array($transport->get())));
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function failoverPullStatusProvider(): iterable
+    {
+        yield 'leader handing over' => ['Leadership Change'];
+        yield 'server shutting down' => ['Server Shutdown'];
+    }
+
+    /**
+     * Only the 409s of a failover are an empty batch: without auto_setup, a 409 that means the consumer is gone
+     * still propagates, as it always has, and so does any other status, whatever its description.
+     */
+    #[DataProvider('pullErrorThatIsNoFailoverProvider')]
+    public function testAPullErrorThatIsNoFailoverStillPropagatesWithoutAutoSetup(int $status, string $description): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())
+            ->method('fetchBatch')
+            ->willReturn(Future::error(new JetStreamException(
+                "JetStream pull request ended with status {$status}: {$description}",
+                $status,
+            )));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage($description);
+
+        iterator_to_array($transport->get());
+    }
+
+    /**
+     * @return iterable<string, array{int, string}>
+     */
+    public static function pullErrorThatIsNoFailoverProvider(): iterable
+    {
+        yield 'consumer deleted mid-pull (409)' => [409, 'Consumer Deleted'];
+        yield 'a failover description on another status' => [503, 'Leadership Change'];
+    }
+
+    /**
+     * With auto_setup, a failover is no sign of a missing consumer: the batch is empty, and nothing is provisioned
+     * again.
+     */
+    public function testAutoSetupDoesNotReprovisionForAFailover(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        // Once, for the first use.
+        $jetStream->expects(self::once())->method('addStream')->willReturn(Future::complete());
+        $jetStream->expects(self::once())->method('addConsumer')->willReturn(Future::complete(new ConsumerInfo(
+            streamName: 'test-stream',
+            name: 'client',
+            push: false,
+            raw: ['config' => ['ack_policy' => 'explicit', 'deliver_policy' => 'all', 'filter_subject' => 'test-topic']],
+        )));
+        $jetStream->expects(self::once())
+            ->method('fetchBatch')
+            ->willReturn(Future::error(self::pullEndedWith409('Leadership Change')));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, ['auto_setup' => true]);
+        $transport->setJetStreamContext($jetStream);
+
+        self::assertSame([], array_values(iterator_to_array($transport->get())));
+    }
+
+    /**
+     * A connection lost during a pull is an empty batch - the client runs with reconnect off, so it closes when the
+     * server shuts down - and the next pull dials again and runs on the new connection.
+     */
+    public function testConnectionLostDuringAPullIsAnEmptyBatchAndTheNextPullDialsAgain(): void
+    {
+        $state = ConnectionState::Idle;
+        $oldConnection = $this->createMock(JetStreamContext::class);
+        $oldConnection->expects(self::once())->method('fetchBatch')->willReturnCallback(
+            static function () use (&$state): Future {
+                $state = ConnectionState::Closed;
+
+                return Future::error(new ConnectionException('Reconnect is disabled'));
+            },
+        );
+        $newConnection = $this->createMock(JetStreamContext::class);
+        $newConnection->expects(self::once())->method('fetchBatch')->willReturn(Future::complete([]));
+
+        $client = $this->clientReportingState($state, [Future::complete(), Future::complete()]);
+        $client->expects(self::exactly(2))->method('jetStream')->willReturnOnConsecutiveCalls($oldConnection, $newConnection);
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, []);
+        $transport->setClient($client);
+
+        self::assertSame([], iterator_to_array($transport->get()));
+        self::assertSame([], iterator_to_array($transport->get()));
+    }
+
+    /**
+     * A dial that fails is no failover: after a connection lost during a pull, get() surfaces the failed dial, so a
+     * server that stays away does not hide behind empty batches.
+     */
+    public function testFailedDialAfterAConnectionLostDuringAPullPropagates(): void
+    {
+        $state = ConnectionState::Idle;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::once())->method('fetchBatch')->willReturnCallback(
+            static function () use (&$state): Future {
+                $state = ConnectionState::Closed;
+
+                return Future::error(new ConnectionException('Reconnect is disabled'));
+            },
+        );
+
+        $refused = new ConnectionException('Connection to tcp://localhost:4222 failed');
+        $client = $this->clientReportingState($state, [Future::complete(), Future::error($refused)]);
+        $client->method('jetStream')->willReturn($jetStream);
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, []);
+        $transport->setClient($client);
+
+        self::assertSame([], iterator_to_array($transport->get()));
+
+        try {
+            iterator_to_array($transport->get());
+            self::fail('expected the dial to fail');
+        } catch (ConnectionException $e) {
+            self::assertSame($refused, $e);
+        }
+    }
+
+    /**
+     * Three pulls in a row a failover ended are empty batches; the fourth, with no pull completing in between,
+     * propagates: pulls that keep failing must not hide behind a worker that reports nothing to do.
+     */
+    public function testFailoversInARowAreEmptyBatchesOnlyUpToTheLimit(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(4))
+            ->method('fetchBatch')
+            ->willReturnCallback(static fn (): Future => Future::error(self::pullEndedWith409('Leadership Change')));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        for ($pull = 1; $pull <= 3; ++$pull) {
+            self::assertSame([], iterator_to_array($transport->get()), "pull {$pull}");
+        }
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Leadership Change');
+
+        iterator_to_array($transport->get());
+    }
+
+    /**
+     * A 409 and a lost connection count toward the same limit: a connection lost after three failovers in a row
+     * propagates.
+     */
+    public function testConnectionLostAfterTheLimitOfFailoversPropagates(): void
+    {
+        $state = ConnectionState::Idle;
+        $lost = new ConnectionException('Reconnect is disabled');
+        $pulls = 0;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(4))->method('fetchBatch')->willReturnCallback(
+            static function () use (&$state, &$pulls, $lost): Future {
+                if (++$pulls <= 3) {
+                    return Future::error(self::pullEndedWith409('Leadership Change'));
+                }
+                $state = ConnectionState::Closed;
+
+                return Future::error($lost);
+            },
+        );
+
+        $client = $this->clientReportingState($state, [Future::complete()]);
+        $client->method('jetStream')->willReturn($jetStream);
+
+        $transport = new RealConnectNatsTransport(self::VALID_DSN, []);
+        $transport->setClient($client);
+
+        for ($pull = 1; $pull <= 3; ++$pull) {
+            self::assertSame([], iterator_to_array($transport->get()), "pull {$pull}");
+        }
+
+        try {
+            iterator_to_array($transport->get());
+            self::fail('expected the lost connection to propagate');
+        } catch (ConnectionException $e) {
+            self::assertSame($lost, $e);
+        }
+    }
+
+    /**
+     * A pull that completes - it returned, or found no messages - ends the failover and starts the count afresh:
+     * three more in a row after it are empty batches again, and the fourth propagates.
+     */
+    #[DataProvider('completedPullProvider')]
+    public function testACompletedPullStartsTheFailoverCountAfresh(\Closure $completedPull): void
+    {
+        $pulls = 0;
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(8))->method('fetchBatch')->willReturnCallback(
+            static function () use (&$pulls, $completedPull): Future {
+                return ++$pulls === 4 ? $completedPull() : Future::error(self::pullEndedWith409('Leadership Change'));
+            },
+        );
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, []);
+        $transport->setJetStreamContext($jetStream);
+
+        for ($pull = 1; $pull <= 7; ++$pull) {
+            self::assertSame([], iterator_to_array($transport->get()), "pull {$pull}");
+        }
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Leadership Change');
+
+        iterator_to_array($transport->get());
+    }
+
+    /**
+     * @return iterable<string, array{\Closure(): Future<mixed>}>
+     */
+    public static function completedPullProvider(): iterable
+    {
+        yield 'pull that returned' => [static fn (): Future => Future::complete([])];
+        yield 'pull that found no messages (408)' => [static fn (): Future => Future::error(new JetStreamException('JetStream pull request ended with status 408: Request Timeout', 408))];
+        yield 'pull that found no messages (404)' => [static fn (): Future => Future::error(new JetStreamException('No Messages', 404))];
+    }
+
+    /**
+     * A real worker keeps running through a leader handover and handles the message the next pull brings. It used
+     * to stop with the 409, as did every worker on the stream, at each server of a cluster restarting.
+     */
+    public function testWorkerKeepsRunningThroughALeaderHandover(): void
+    {
+        $jetStream = $this->createMock(JetStreamContext::class);
+        $jetStream->expects(self::exactly(2))->method('fetchBatch')->willReturnOnConsecutiveCalls(
+            Future::error(self::pullEndedWith409('Leadership Change')),
+            Future::complete([
+                new NatsMessage(subject: 'test-topic', sid: 1, replyTo: '$JS.ACK.test-stream.client.1.1.1.0.0', payload: 'encoded'),
+            ]),
+        );
+        $jetStream->expects(self::once())->method('ack')->willReturn(Future::complete());
+
+        $serializer = $this->createMock(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope(new \stdClass()));
+
+        $transport = new RuntimeTestableNatsTransport(self::VALID_DSN, [], $serializer);
+        $transport->setJetStreamContext($jetStream);
+
+        $handled = 0;
+        $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
+            \stdClass::class => [static function () use (&$handled): void {
+                ++$handled;
+            }],
+        ]))]);
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new StopWorkerOnMessageLimitListener(1));
+
+        (new Worker(['async' => $transport], $bus, $dispatcher))->run(['sleep' => 0]);
+
+        self::assertSame(1, $handled);
+    }
+
+    /**
+     * How the client reports a pull the server ended with a 409 ({@see UnansweredPullTest} runs the real client).
+     */
+    private static function pullEndedWith409(string $description): JetStreamException
+    {
+        return new JetStreamException('JetStream pull request ended with status 409: ' . $description, 409);
+    }
+
     public function testSetupPreservesAnOriginalReplayPolicyWhenTheOptionIsRemoved(): void
     {
         $jetStream = $this->createMock(JetStreamContext::class);

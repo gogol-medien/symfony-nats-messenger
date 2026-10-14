@@ -14,6 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport made, failing `testOnlyAPullTheServerDidNotAnswerMakesTheNextOneCheckTheConnection` against that client.
   The server still answers every PING but records only one written on its own. The test passes against client
   2.10.3 and 2.19.0; the transport is unchanged.
+- **The unanswered-pull test's scripted server answers a pull with any status**, not only 408, for the test
+  that runs the real client against a 409 "Leadership Change".
+
+### Fixed
+- **A worker keeps running when a cluster fails over.** A server entering lame duck mode - each one does in
+  a rolling restart of a cluster - hands its stream and consumer leaders over, which ends a pull running at
+  that moment with status 409 "Leadership Change" ("Server Shutdown" once the server goes), and then closes
+  its connections. `get()` let both propagate - the 409 as a missing consumer, the lost connection as it
+  was - so every worker pulling from the stream stopped, at each server that restarted: in a rolling update
+  of a three-server cluster to nats-server 2.15.1, each worker stopped two to three times. `get()` now reads a
+  pull a failover ended as an empty batch, and the next pull reaches the new leader, dialling again if the
+  connection was lost. A failover is no sign of a missing consumer, so `auto_setup` does not re-provision for
+  one. At most three such pulls in a row are absorbed; the fourth, with no pull completing in between,
+  propagates, as do a dial that fails and every other 409, such as "Consumer Deleted".
 
 ## [5.4.1] - 2026-10-05
 

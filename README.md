@@ -676,9 +676,10 @@ connection has been lost, the next operation dials again instead:
   minutes; a load balancer or NAT gateway may drop an idle connection sooner.
 - The operation that runs into the lost connection fails. For `send()` that means the outcome is unknown:
   the server may or may not have stored the message. Once the client reports the connection closed, the
-  next operation opens a new one. A consumer worker exits on the failed `get()` and its supervisor starts a
-  new one; a process that sends for longer than one request (a web app in worker mode such as FrankenPHP or
-  RoadRunner, a daemon, a handler that dispatches) keeps working from the next operation on.
+  next operation opens a new one. A consumer worker reads a connection lost during a pull as an empty batch
+  and dials again on its next pull ([Cluster Failover](#cluster-failover)); a process that sends for longer
+  than one request (a web app in worker mode such as FrankenPHP or RoadRunner, a daemon, a handler that
+  dispatches) keeps working from the next operation on.
 - With `auto_setup`, the new connection is verified in the same call that dials it, and a dial that fails
   surfaces as the connection error itself.
 
@@ -703,6 +704,21 @@ options:
 ```
 
 > **Tested by:** `testOperationAfterTheClientClosedDialsAgain`, `testAutoSetupVerifiesTheNewConnectionBeforeTheSameCallPublishes`, `testFailedDialAfterTheClientClosedSurfacesAsTheConnectionErrorAndIsRetried`, `testIdleConnectionIsCheckedWithAPingAndKeptWhenTheServerAnswers`, `testIdleConnectionThatDoesNotAnswerThePingIsReplacedBeforeTheOperation`, `testPingUnansweredWithinTheConnectionTimeoutReplacesTheConnection`, `testRecentlyUsedConnectionIsNotPinged`, `testPingAfterIdleZeroTurnsTheCheckOff`, `testKeepaliveNeitherPingsNorDials`, `testOperationThatFailedOnTheConnectionMakesTheNextOneCheckItFirst`, `testJetStreamReplyDoesNotMakeTheNextOperationCheckTheConnection`, `testPullTheServerDidNotAnswerMakesTheNextOperationCheckTheConnection`, `testOnlyAPullTheServerDidNotAnswerMakesTheNextOneCheckTheConnection`, `testIdleTimeCountsFromTheEndOfAnEmptyPull`, `testBuildWithInvalidPingAfterIdleThrowsException`, Behat scenarios `A message sent after the server dropped the idle connection goes out` and `Without the check the message sent after the server dropped the connection fails`
+
+### Cluster Failover
+
+When a server of a JetStream cluster restarts - one server at a time in a rolling update - it first enters
+lame duck mode and hands the streams and consumers it leads over to other servers. A pull running at that
+moment ends with status 409 "Leadership Change", or "Server Shutdown" once the server goes, and a consumer
+connected to that server then loses its connection. `get()` reads each of these as an empty batch: the
+worker's next pull reaches the new leader, on a new connection if need be, and messages a lost pull had
+delivered are redelivered, since they were never acknowledged.
+
+Pulls keep failing that way only while something is wrong, so `get()` absorbs at most three in a row; the
+next one, with no pull completing in between, propagates. A dial that fails always propagates, and so does
+a 409 that means something else, such as "Consumer Deleted".
+
+> **Tested by:** `testPullAFailoverEndedIsAnEmptyBatch`, `testAPullErrorThatIsNoFailoverStillPropagatesWithoutAutoSetup`, `testAutoSetupDoesNotReprovisionForAFailover`, `testConnectionLostDuringAPullIsAnEmptyBatchAndTheNextPullDialsAgain`, `testFailedDialAfterAConnectionLostDuringAPullPropagates`, `testFailoversInARowAreEmptyBatchesOnlyUpToTheLimit`, `testConnectionLostAfterTheLimitOfFailoversPropagates`, `testACompletedPullStartsTheFailoverCountAfresh`, `testWorkerKeepsRunningThroughALeaderHandover`, `testAPullALeaderHandoverEndedIsAnEmptyBatchAndNeedsNoCheck`
 
 ## Stream Configuration
 
